@@ -1,422 +1,267 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
+const qrcodeTerminal = require('qrcode-terminal');
+const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const multer = require('multer');
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + '-' + file.originalname);
-    }
-});
-
-const upload = multer({ storage: storage });
+const os = require('os');
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-let isConnected = false;
-let chromePath = process.env.CHROME_PATH;
+// ===== Sesión persistente =====
+// En hosting con disco persistente, apunta DATA_PATH a un volumen persistente.
+// En Railway/Render/Fly, monta un volumen y usa /data por ejemplo.
+const DATA_PATH = process.env.DATA_PATH || path.join(__dirname, '.wwebjs_auth');
 
-if (!chromePath) {
-    if (process.platform === 'android' || fs.existsSync('/data/data/com.termux')) {
-        chromePath = '/data/data/com.termux/files/usr/bin/chromium';
-    } else if (process.platform === 'win32') {
-        chromePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-    } else {
-        if (fs.existsSync('/usr/bin/chromium')) {
-            chromePath = '/usr/bin/chromium';
-        } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-            chromePath = '/usr/bin/chromium-browser';
-        } else if (fs.existsSync('/usr/bin/google-chrome-stable')) {
-            chromePath = '/usr/bin/google-chrome-stable';
-        } else {
-            chromePath = '/usr/bin/chromium-browser';
-        }
+// ===== Carpeta temporal para archivos subidos =====
+const uploadDir = path.join(os.tmpdir(), 'whatshack_uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const upload = multer({
+    dest: uploadDir,
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB
+});
+
+// ===== Middlewares =====
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// CORS manual (sin librería) para que puedas llamarlo desde cualquier origen
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
+// ===== Estado global =====
+let client = null;
+let isReady = false;
+let currentQrDataUrl = null;
+let isAuthenticated = false;
+let lastQrTimestamp = 0;
+
+// ===== Inicializar cliente =====
+function initClient() {
+    if (client) {
+        try { client.destroy(); } catch (e) {}
+        client = null;
     }
+
+    console.log('[WPL] Inicializando cliente...');
+
+    client = new Client({
+        authStrategy: new LocalAuth({ dataPath: DATA_PATH }),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--no-zygote',
+                '--single-process'
+            ],
+            // En hosting a veces hay que forzar el path de Chromium
+            executablePath: process.env.CHROME_PATH || undefined
+        }
+    });
+
+    client.on('qr', async (qr) => {
+        console.log('[WPL] QR recibido');
+        qrcodeTerminal.generate(qr, { small: true });
+        try {
+            currentQrDataUrl = await qrcode.toDataURL(qr, { width: 500 });
+            lastQrTimestamp = Date.now();
+        } catch (e) {
+            console.error('[WPL] Error generando QR:', e.message);
+        }
+    });
+
+    client.on('authenticated', () => {
+        console.log('[WPL] Autenticado');
+        isAuthenticated = true;
+    });
+
+    client.on('ready', () => {
+        console.log('[WPL] Cliente listo');
+        isReady = true;
+        currentQrDataUrl = null;
+    });
+
+    client.on('auth_failure', (msg) => {
+        console.error('[WPL] Fallo de autenticación:', msg);
+        isReady = false;
+        isAuthenticated = false;
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log('[WPL] Desconectado:', reason);
+        isReady = false;
+        isAuthenticated = false;
+        currentQrDataUrl = null;
+        setTimeout(initClient, 5000);
+    });
+
+    client.initialize().catch(err => {
+        console.error('[WPL] Error init:', err.message);
+        setTimeout(initClient, 10000);
+    });
 }
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    qrMaxRetries: 5,
-    takeoverOnConflict: true,
-    puppeteer: {
-        headless: true,
-        handleSIGINT: false,
-        executablePath: chromePath,
-        timeout: 120000,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-component-update',
-            '--disable-default-apps',
-            '--no-default-browser-check',
-            '--unhandled-rejections=strict'
-        ]
-    }
-});
+initClient();
 
-function processEmojisAndText(text, version) {
-    if (!text) return "";
-    const isAndroid41OrHigher = version && parseFloat(version) >= 4.1;
+// ===== ENDPOINTS =====
 
-    if (!isAndroid41OrHigher) {
-        const emojiMap = {
-            '😂': ':-D', '😀': ':-)', '😁': ':-D', '🙂': ':-)', '😊': ':-)',
-            '😉': ';-)', '😍': '<3', '🥰': '<3', '😘': ':-*', '❤️': '<3',
-            '💕': '<3', '😭': ':-(', '😢': ':-(', '☹️': ':-(', '👍': '(Y)',
-            '👎': '(N)', '😮': ':-O', '😲': ':-O', '🤔': ':-/', '😐': ':-|',
-            '😛': ':-P', '😜': ';-P', '😋': ':-P', '😡': ':-@',
-            '😎': 'B-)', '🤑': ':-$', '😵': 'x-(', '🤐': ':-!', '😶': ':-X',
-            '🤠': 'o:-)', '🤨': 'o_O'
-        };
-
-        for (const [emoji, replacement] of Object.entries(emojiMap)) {
-            text = text.replaceAll(emoji, replacement);
-        }
-    }
-    const modernEmojiRegex = /[\u{1F300}-\u{1F9FF}]|[\u{1F600}-\u{1F64F}]|[\u{1F680}-\u{1F6FF}]|[\u{2600}-\u{27BF}]|[\u{1F000}-\u{1FBF9}]/gu;
-    if (!isAndroid41OrHigher) {
-        text = text.replace(modernEmojiRegex, "∅");
-        text = text.replace(/[^\x00-\x7F\u0100-\u017F\u0180-\u024F\u1E00-\u1EFF]/g, "∅");
-    }
-
-    if (text.trim() === "" || /^∅+$/.test(text.trim())) {
-        return "";
-    }
-
-    return text;
-}
-
-client.on('ready', () => {
-    console.log('WhatsApp Client is ready!');
-    isConnected = true;
-});
-
-client.on('authenticated', () => {
-    console.log('Authenticated successfully');
-});
-
-client.on('auth_failure', () => {
-    console.error('Authentication failed');
-    isConnected = false;
-});
-
-client.on('disconnected', (reason) => {
-    console.log('Client disconnected, reason:', reason);
-    isConnected = false;
-    setTimeout(() => {
-        console.log('Attempting to reconnect...');
-        client.initialize().catch(err => console.log('Re-init error:', err));
-    }, 5000);
-});
-
+// Status + QR actual
 app.get('/status', (req, res) => {
-    res.json({ success: true, loggedIn: isConnected });
+    res.json({
+        success: true,
+        loggedIn: isReady,
+        authenticated: isAuthenticated,
+        qr: isReady ? null : currentQrDataUrl,
+        timestamp: lastQrTimestamp
+    });
 });
 
-app.get('/get-code', async (req, res) => {
-    const phoneNumber = req.query.phone;
-    if (!phoneNumber) {
-        return res.json({ success: false, error: "Phone number required" });
-    }
-
-    try {
-        if (isConnected) {
-            return res.json({ success: true, pairingCode: "CONNECTED" });
-        }
-
-        const code = await client.requestPairingCode(phoneNumber);
-        res.json({ success: true, pairingCode: code });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
+// QR directo
+app.get('/qr', (req, res) => {
+    if (isReady) return res.json({ success: false, error: 'Ya conectado' });
+    if (!currentQrDataUrl) return res.status(503).json({ success: false, error: 'QR aún no disponible' });
+    res.json({ success: true, qr: currentQrDataUrl });
 });
 
-app.get('/get-profile-pic', async (req, res) => {
-    try {
-        const id = req.query.id;
-        if (!id) return res.status(400).send("ID required");
-
-        const url = await client.getProfilePicUrl(id);
-        if (url) {
-            return res.json({ success: true, url: url });
-        } else {
-            return res.json({ success: false, url: null });
-        }
-    } catch (err) {
-        res.json({ success: false, error: err.message });
-    }
-});
-
+// Lista de chats
 app.get('/get-chats', async (req, res) => {
+    if (!isReady) return res.status(503).json({ success: false, error: 'Cliente no listo' });
     try {
-        if (!isConnected) {
-            return res.json({ success: false, error: "Client not connected" });
-        }
-
-        const version = req.query.v;
         const chats = await client.getChats();
-        const formattedChats = chats.slice(0, 20).map(chat => {
-            let lastMsgText = chat.lastMessage ? chat.lastMessage.body : "";
-            if (chat.lastMessage && chat.lastMessage.hasMedia) {
-                if (chat.lastMessage.isGif) {
-                    lastMsgText = "[GIF]";
-                } else {
-                    switch (chat.lastMessage.type) {
-                        case 'image': lastMsgText = "[Photo]"; break;
-                        case 'sticker': lastMsgText = "[Sticker]"; break;
-                        case 'video': lastMsgText = "[Video]"; break;
-                        case 'audio':
-                        case 'ptt': lastMsgText = "[Audio]"; break;
-                        default: lastMsgText = "[Media]";
-                    }
-                }
-            }
-            lastMsgText = processEmojisAndText(lastMsgText, version);
-
-            return {
-                id: chat.id._serialized,
-                name: chat.name || "Unknown",
-                lastMessage: lastMsgText || "[Message]"
-            };
-        });
-
-        res.json({ success: true, chats: formattedChats });
-    } catch (err) {
-        res.json({ success: false, error: err.message });
+        const list = chats.map(c => ({
+            id: c.id._serialized,
+            name: c.name || c.id.user || 'Sin nombre',
+            lastMessage: c.lastMessage ? c.lastMessage.body : '',
+            timestamp: c.timestamp || 0,
+            unreadCount: c.unreadCount || 0,
+            isGroup: !!c.isGroup
+        }));
+        list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        res.json({ success: true, chats: list });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
+// Mensajes de un chat
 app.get('/get-messages', async (req, res) => {
+    if (!isReady) return res.status(503).json({ success: false, error: 'Cliente no listo' });
+    const chatId = req.query.id;
+    if (!chatId) return res.status(400).json({ success: false, error: 'id requerido' });
+
     try {
-        const chatId = req.query.id;
-        const version = req.query.v;
-
-        if (!chatId) {
-            return res.json({ success: false, error: "Chat ID required" });
-        }
-
         const chat = await client.getChatById(chatId);
-        const messages = await chat.fetchMessages({ limit: 25 });
-
-        const formattedMessages = [];
-
-        for (const msg of messages) {
-            let bodyText = msg.body || "";
-            let mediaType = "none";
-
-            if (msg.hasMedia) {
-                if (msg.isGif || msg.type === 'gif') {
-                    mediaType = 'gif';
-                    bodyText = "";
-                } else {
-                    switch (msg.type) {
-                        case 'image':
-                            mediaType = 'image';
-                            bodyText = msg.body ? msg.body : "";
-                            break;
-                        case 'sticker':
-                            mediaType = 'sticker';
-                            bodyText = "";
-                            break;
-                        case 'video':
-                            mediaType = 'video';
-                            bodyText = msg.body ? msg.body : "";
-                            break;
-                        case 'audio':
-                        case 'ptt':
-                            mediaType = 'audio';
-                            bodyText = "[Audio]";
-                            break;
-                        case 'document':
-                            mediaType = 'document';
-                            bodyText = msg.body ? msg.body : "[Document]";
-                            break;
-                        default:
-                            bodyText = "";
-                    }
-                }
-            } else {
-                switch (msg.type) {
-                    case 'location': bodyText = "[Location]"; break;
-                    case 'vcard': bodyText = "[Contact]"; break;
-                    case 'revoked': bodyText = "This message was deleted"; break;
-                }
-            }
-
-            bodyText = processEmojisAndText(bodyText, version);
-
-            if (chatId.endsWith('@g.us') && !msg.fromMe) {
-                try {
-                    const contact = await msg.getContact();
-                    const senderName = contact.name || contact.pushname || msg.author.split('@')[0];
-                    bodyText = bodyText ? `~ ${senderName} ~\n${bodyText}` : `~ ${senderName} ~`;
-                } catch (e) {
-                    const fallbackNumber = msg.author ? msg.author.split('@')[0] : "Unknown";
-                    bodyText = bodyText ? `~ ${fallbackNumber} ~\n${bodyText}` : `~ ${fallbackNumber} ~`;
-                }
-            }
-
-            formattedMessages.push({
-                id: msg.id._serialized,
-                body: bodyText,
-                fromMe: msg.fromMe,
-                timestamp: msg.timestamp,
-                mediaType: mediaType
-            });
-        }
-
-        res.json({ success: true, messages: formattedMessages });
-
-    } catch (error) {
-        res.json({ success: false, error: error.message });
+        const msgs = await chat.fetchMessages({ limit: 100 });
+        const list = msgs.map(m => ({
+            id: m.id._serialized,
+            body: m.body || '',
+            fromMe: m.fromMe,
+            timestamp: m.timestamp,
+            type: m.type,
+            hasMedia: m.hasMedia,
+            from: m.from,
+            author: m.author || null
+        }));
+        res.json({ success: true, messages: list });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-app.get('/get-media', async (req, res) => {
-    try {
-        const msgId = req.query.msgId;
-        if (!msgId) {
-            return res.status(400).send("Message ID required");
-        }
-
-        const msg = await client.getMessageById(msgId);
-        if (!msg || !msg.hasMedia) {
-            return res.status(404).send("Media not found");
-        }
-
-        const media = await msg.downloadMedia();
-        if (!media || !media.data) {
-            return res.status(500).send("Media download failed");
-        }
-
-        const imgBuffer = Buffer.from(media.data, 'base64');
-        const mimeType = media.mimetype || 'application/octet-stream';
-
-        res.set('Content-Type', mimeType);
-        res.set('Content-Length', imgBuffer.length);
-        res.send(imgBuffer);
-
-    } catch (err) {
-        console.error("Get media error:", err);
-        res.status(500).send("Error fetching media: " + err.message);
-    }
-});
-
+// Enviar texto
 app.get('/send-message', async (req, res) => {
+    if (!isReady) return res.status(503).json({ success: false, error: 'Cliente no listo' });
+    const { id, text } = req.query;
+    if (!id || !text) return res.status(400).json({ success: false, error: 'id y text requeridos' });
+
     try {
-        const chatId = req.query.id;
-        let messageText = req.query.text;
-        const version = req.query.v;
-
-        if (!chatId || !messageText) {
-            return res.json({ success: false, error: "Chat ID and text required" });
-        }
-
-        if (!isConnected) {
-            return res.json({ success: false, error: "Client not connected" });
-        }
-
-        if (!(version && parseFloat(version) >= 4.1)) {
-            const gidenEmojiMap = {
-                ':-D': '😂', ':-)': '🙂', ';-)': '😉', '<3': '❤️',
-                ':-*': '😘', ':-(': '😭', ':-P': '😛', ';-P': '😜',
-                ':-O': '😮', ':-/': '🤔', ':-|': '😐', ':-@': '😡',
-                '(Y)': '👍', '(N)': '👎',
-                'B-)': '😎', ':-$': '🤑', 'x-(': '😵', ':-!': '🤐',
-                ':-X': '😶', 'o:-)': '🤠', 'o_O': '🤨'
-            };
-
-            const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-            for (const [textEmoticon, emoji] of Object.entries(gidenEmojiMap)) {
-                const regex = new RegExp(escapeRegExp(textEmoticon), 'g');
-                messageText = messageText.replace(regex, emoji);
-            }
-        }
-
-        await client.sendMessage(chatId, messageText);
+        await client.sendMessage(id, text);
         res.json({ success: true });
-
-    } catch (error) {
-        if (!res.headersSent) {
-            res.json({ success: false, error: error.message });
-        }
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-app.post('/send-file', upload.single('file'), async (req, res) => {
-    let filePath = null;
+// Enviar media
+app.post('/send-media', upload.single('file'), async (req, res) => {
+    const cleanup = () => { if (req.file) fs.unlink(req.file.path, () => {}); };
+
+    if (!isReady) { cleanup(); return res.status(503).json({ success: false, error: 'Cliente no listo' }); }
+
+    const chatId = req.body.chatId;
+    if (!chatId || !req.file) { cleanup(); return res.status(400).json({ success: false, error: 'chatId y file requeridos' }); }
+
     try {
-        const chatId = req.body.id;
-        const file = req.file;
-
-        if (!chatId || !file) {
-            return res.json({ success: false, error: "Chat ID and file required" });
-        }
-
-        filePath = path.resolve(file.path);
-        const media = MessageMedia.fromFilePath(filePath);
-
-        media.filename = file.originalname;
-        if (file.mimetype) {
-            media.mimetype = file.mimetype;
-        }
-
-        await client.sendMessage(chatId, media, { sendMediaAsDocument: true });
-
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-        }
-
+        const media = MessageMedia.fromFilePath(req.file.path);
+        const opts = {};
+        if (req.body.caption) opts.caption = req.body.caption;
+        await client.sendMessage(chatId, media, opts);
+        cleanup();
         res.json({ success: true });
-    } catch (err) {
-        if (filePath && fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-        }
-        res.json({ success: false, error: err.message });
+    } catch (e) {
+        cleanup();
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-app.get('/screenshot', async (req, res) => {
+// Verificar si un número tiene WhatsApp + devolver su ID
+app.get('/new-chat', async (req, res) => {
+    if (!isReady) return res.status(503).json({ success: false, error: 'Cliente no listo' });
+    const phone = (req.query.phone || '').replace(/[^0-9]/g, '');
+    if (!phone) return res.status(400).json({ success: false, error: 'phone requerido' });
+
     try {
-        if (!client.pupBrowser) {
-            return res.status(400).send("Browser not started yet.");
-        }
-
-        const pages = await client.pupBrowser.pages();
-        if (pages.length === 0) {
-            return res.status(400).send("No open browser page found.");
-        }
-
-        const activePage = pages[0];
-        const screenshotBuffer = await activePage.screenshot({ type: 'png' });
-
-        res.set('Content-Type', 'image/png');
-        res.send(screenshotBuffer);
-    } catch (err) {
-        res.status(500).send("Error taking screenshot: " + err.message);
+        const numberId = await client.getNumberId(phone);
+        if (!numberId) return res.status(404).json({ success: false, error: 'Número sin WhatsApp' });
+        res.json({ success: true, id: numberId._serialized });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-client.initialize().catch(err => {
-    console.log('Puppeteer init error:', err);
+// Logout
+app.get('/logout', async (req, res) => {
+    try {
+        if (client) {
+            try { await client.logout(); } catch (e) {}
+            try { await client.destroy(); } catch (e) {}
+        }
+        isReady = false;
+        isAuthenticated = false;
+        currentQrDataUrl = null;
+        setTimeout(initClient, 2000);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
-app.listen(port, () => {
-    console.log(`WPL Server running on port ${port}`);
+// Health check para hosting
+app.get('/', (req, res) => {
+    res.json({ service: 'whatshack-server', ok: true, ready: isReady });
 });
 
+// ===== Arrancar =====
+app.listen(PORT, HOST, () => {
+    console.log(`[WPL] Servidor escuchando en http://${HOST}:${PORT}`);
+    console.log(`[WPL] DATA_PATH: ${DATA_PATH}`);
+    console.log(`[WPL] Uploads:   ${uploadDir}`);
+    console.log('[WPL] Esperando conexión de WhatsApp...');
+});
+
+// Cierre limpio
+process.on('SIGTERM', () => { console.log('[WPL] SIGTERM'); process.exit(0); });
+process.on('SIGINT',  () => { console.log('[WPL] SIGINT');  process.exit(0); });
